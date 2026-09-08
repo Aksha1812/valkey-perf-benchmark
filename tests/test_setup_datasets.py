@@ -251,3 +251,189 @@ class TestVectorHybridQueryAlignment:
                 f"query term {decoded!r} does not appear in hybrid dataset titles "
                 f"({sorted(titles)}) — KNN benchmark would silently return no hits"
             )
+
+
+# ---- _int_to_base26 --------------------------------------------------------
+
+
+class TestIntToBase26:
+    """Base-26 encoding backs unique_tokens / cyclic_pattern / progressive_prefix.
+    An off-by-one in the carry would collide tokens that must stay distinct.
+    """
+
+    def test_single_letter_range(self):
+        assert setup_datasets._int_to_base26(0) == "a"
+        assert setup_datasets._int_to_base26(25) == "z"
+
+    def test_two_letter_rollover(self):
+        # 26 must roll to "aa" (not "ba"): the sequence is a..z, aa, ab, ...
+        assert setup_datasets._int_to_base26(26) == "aa"
+        assert setup_datasets._int_to_base26(27) == "ab"
+        assert setup_datasets._int_to_base26(51) == "az"
+        assert setup_datasets._int_to_base26(52) == "ba"
+
+    def test_three_letter_rollover(self):
+        assert setup_datasets._int_to_base26(701) == "zz"
+        assert setup_datasets._int_to_base26(702) == "aaa"
+
+    def test_values_are_unique_and_monotonic_in_length(self):
+        seen = [setup_datasets._int_to_base26(i) for i in range(1000)]
+        assert len(set(seen)) == 1000  # no collisions
+        # length is non-decreasing as the integer grows
+        lengths = [len(s) for s in seen]
+        assert lengths == sorted(lengths)
+
+
+# ---- ingestion transforms --------------------------------------------------
+
+
+def _apply(t, field_size=1000, doc_num=1, total_docs=100):
+    return setup_datasets.apply_transforms("", [t], field_size, doc_num, total_docs)
+
+
+class TestRepeatedToken:
+    def test_emits_token_repeated_n_times(self):
+        content = _apply({"type": "repeated_token", "token": "b", "token_count": 5})
+        assert content == "b b b b b"
+
+    def test_deterministic(self):
+        t = {"type": "repeated_token", "token": "z", "token_count": 8}
+        assert _apply(t) == _apply(t)
+
+
+class TestCyclicPattern:
+    def test_cycles_through_alphabet(self):
+        content = _apply(
+            {"type": "cyclic_pattern", "cycle_length": 3, "token_count": 7}
+        )
+        assert content.split() == ["a", "b", "c", "a", "b", "c", "a"]
+
+    def test_deterministic(self):
+        t = {"type": "cyclic_pattern", "cycle_length": 5, "token_count": 20}
+        assert _apply(t) == _apply(t)
+
+
+class TestUniqueTokens:
+    def test_tokens_are_disjoint_across_documents(self):
+        t = {"type": "unique_tokens", "token_count": 4}
+        doc1 = set(_apply(t, doc_num=1).split())
+        doc2 = set(_apply(t, doc_num=2).split())
+        assert doc1 == {"a", "b", "c", "d"}
+        assert doc2 == {"e", "f", "g", "h"}
+        assert doc1.isdisjoint(doc2)
+
+    def test_deterministic(self):
+        t = {"type": "unique_tokens", "token_count": 10}
+        assert _apply(t, doc_num=3) == _apply(t, doc_num=3)
+
+
+class TestUuidTokens:
+    def test_token_count_and_length(self):
+        content = _apply(
+            {"type": "uuid_tokens", "token_count": 3, "char_length": 8},
+            field_size=1000,
+        )
+        tokens = content.split()
+        assert len(tokens) == 3
+        assert all(len(tok) == 8 for tok in tokens)
+
+    def test_seeded_and_reproducible_per_doc(self):
+        t = {"type": "uuid_tokens", "token_count": 3, "char_length": 16}
+        assert _apply(t, doc_num=7) == _apply(t, doc_num=7)
+        assert _apply(t, doc_num=7) != _apply(t, doc_num=8)
+
+
+class TestProgressivePrefix:
+    def test_prefixes_grow_in_length(self):
+        content = _apply(
+            {"type": "progressive_prefix", "max_depth": 3, "leaf_count": 2},
+            doc_num=1,
+        )
+        tokens = content.split()
+        # doc 1 base unit is "a": a, aa, aaa, then leaves off the deepest prefix
+        assert tokens[:3] == ["a", "aa", "aaa"]
+        assert tokens[3:] == ["aaaa", "aaab"]
+
+    def test_base_unit_differs_per_doc(self):
+        t = {"type": "progressive_prefix", "max_depth": 2, "leaf_count": 1}
+        assert _apply(t, doc_num=1).split()[0] == "a"
+        assert _apply(t, doc_num=2).split()[0] == "b"
+
+
+class TestRandomFromSet:
+    def test_all_tokens_drawn_from_the_set(self):
+        token_set = ["x", "y", "z"]
+        content = _apply(
+            {"type": "random_from_set", "token_set": token_set, "token_count": 20}
+        )
+        tokens = content.split()
+        assert len(tokens) == 20
+        assert set(tokens) <= set(token_set)
+
+    def test_seeded_and_reproducible_per_doc(self):
+        t = {"type": "random_from_set", "token_set": list("abcde"), "token_count": 30}
+        assert _apply(t, doc_num=4) == _apply(t, doc_num=4)
+
+
+class TestStemmableWordsTransform:
+    def test_returns_empty_and_warns_only_once(self, caplog):
+        # apply_transforms runs per document; the direct-use warning must not be
+        # emitted once per doc.
+        setup_datasets._stemmable_direct_warned = False
+        t = {"type": "stemmable_words", "token_count": 100}
+        with caplog.at_level("WARNING"):
+            first = _apply(t, doc_num=1)
+            second = _apply(t, doc_num=2)
+        assert first == "" and second == ""
+        warnings = [r for r in caplog.records if "stemmable_words" in r.message]
+        assert len(warnings) == 1
+
+
+# ---- stemmable dataset generation ------------------------------------------
+
+
+class TestExtractStemmableWords:
+    def test_keeps_only_stemmable_words_sorted(self, tmp_path: Path):
+        # Minimal MediaWiki-style dump. "running/jumps/cats" stem to a different
+        # root; "the" is a stop-length non-stemmable word.
+        wiki = tmp_path / "wiki.xml"
+        wiki.write_text(
+            "<mediawiki><page><title>t</title><revision>"
+            "<text>running jumps cats the</text>"
+            "</revision></page></mediawiki>",
+            encoding="utf-8",
+        )
+        words = setup_datasets.extract_stemmable_words_from_wiki(wiki)
+        assert set(words) == {"running", "jumps", "cats"}
+        # Sorted output is required for reproducible seeded sampling downstream.
+        assert words == sorted(words)
+
+
+class TestGenerateStemmableDataset:
+    def test_reproducible_and_uses_only_extracted_words(
+        self, tmp_path: Path, monkeypatch
+    ):
+        vocab = ["cats", "jumps", "running", "walked", "faster"]
+        monkeypatch.setattr(
+            setup_datasets, "extract_stemmable_words_from_wiki", lambda _f: vocab
+        )
+        config = {"doc_count": 3, "fields": [{"transforms": [{"token_count": 4}]}]}
+
+        setup_datasets.generate_stemmable_dataset(
+            tmp_path, tmp_path / "dummy.xml", config, "stem_a.csv"
+        )
+        setup_datasets.generate_stemmable_dataset(
+            tmp_path, tmp_path / "dummy.xml", config, "stem_b.csv"
+        )
+
+        rows_a = list(csv.reader((tmp_path / "stem_a.csv").open()))
+        rows_b = list(csv.reader((tmp_path / "stem_b.csv").open()))
+        assert rows_a[0] == ["field1"]
+        assert len(rows_a) == 1 + 3  # header + doc_count rows
+        # Every emitted token comes from the extracted vocabulary.
+        for row in rows_a[1:]:
+            tokens = row[0].split()
+            assert len(tokens) == 4
+            assert set(tokens) <= set(vocab)
+        # Seeded per-doc RNG => byte-identical output across runs.
+        assert rows_a == rows_b

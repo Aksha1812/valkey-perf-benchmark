@@ -34,6 +34,10 @@ def _make_rng(filename: str) -> "np.random.Generator":
 # Alphabet used for deterministic random-word generation (fuzzy datasets)
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
+# Guards the "stemmable_words used directly" warning so it fires once per run
+# instead of once per document (apply_transforms is called for every doc).
+_stemmable_direct_warned = False
+
 # Constants for query generation
 STOP_WORDS = {
     "a",
@@ -410,11 +414,16 @@ def apply_transforms(
             content = " ".join(tokens)
 
         elif ttype == "stemmable_words":
-            # Handled by generate_stemmable_dataset - warn if used directly
-            logging.warning(
-                "stemmable_words transform used directly; "
-                "use generate_stemmable_dataset for proper handling"
-            )
+            # Handled by generate_stemmable_dataset. If it reaches here the field
+            # was routed through the generic path (filename lacks "stemmable"),
+            # which yields empty content - warn once rather than per document.
+            global _stemmable_direct_warned
+            if not _stemmable_direct_warned:
+                logging.warning(
+                    "stemmable_words transform used directly; "
+                    "use generate_stemmable_dataset for proper handling"
+                )
+                _stemmable_direct_warned = True
             content = ""
 
         elif ttype == "vector":
