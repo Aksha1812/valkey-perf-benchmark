@@ -4,20 +4,26 @@
 import argparse
 import json
 import logging
-import os
 import platform
+from itertools import product
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 import sys
 
 
 from valkey_build import ServerBuilder
-from valkey_server import ServerLauncher
-from valkey_benchmark import ClientRunner
+from valkey_server import ServerLauncher, apply_config_to_servers
+from valkey_benchmark import (
+    ClientRunner,
+    ORIGIN_FIELD,
+    ORIGIN_SIMPLE,
+    READ_COMMANDS,
+    READ_POPULATE_MAP,
+    WRITE_COMMANDS,
+)
 from benchmark_build import BenchmarkBuilder
 from utils.cpu_utils import (
     parse_core_range,
-    calculate_cpu_ranges,
     calculate_server_cpu_ranges,
     calculate_client_cpu_ranges,
     validate_explicit_cpu_ranges,
@@ -25,6 +31,7 @@ from utils.cpu_utils import (
 
 # ---------- Constants --------------------------------------------------------
 DEFAULT_RESULTS_ROOT = Path("results")
+DEFAULT_CONFIG_FILE = "./configs/benchmark-configs.json"
 REQUIRED_KEYS = [
     "keyspacelen",
     "data_sizes",
@@ -55,10 +62,26 @@ OPTIONAL_CONF_KEYS = [
     "query_generation",
     "port",
     "module_startup_args",
+    "custom-server-configs",
+    "custom-server-config-file",
 ]
 
 
 # ---------- CLI --------------------------------------------------------------
+def _validate_repository_format(value: str) -> str:
+    """Validate repository is in 'owner/repo' format."""
+    if value.count("/") != 1:
+        raise argparse.ArgumentTypeError(
+            f"Invalid repository format: '{value}'. Expected 'owner/repo' format."
+        )
+    owner, repo = value.split("/")
+    if not owner or not repo:
+        raise argparse.ArgumentTypeError(
+            f"Invalid repository format: '{value}'. Owner and repo cannot be empty."
+        )
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -111,10 +134,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="./configs/benchmark-configs.json",
+        default=None,
         help=(
             "Path to benchmark-configs.json. Each entry is an explicit benchmark "
             "configuration and combinations are not generated automatically."
+            "Defaults to './configs/benchmark-configs.json' if not provided."
         ),
     )
     parser.add_argument(
@@ -170,6 +194,19 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--module-commit",
+        type=str,
+        default=None,
+        help="Module commit SHA (written to metrics for tracking module versions).",
+    )
+    parser.add_argument(
+        "--module-commit-timestamp",
+        type=str,
+        default=None,
+        help="Module commit timestamp ISO 8601 (written to metrics for module tracking).",
+    )
+
+    parser.add_argument(
         "--skip-config-set",
         action="store_true",
         help="Skip CONFIG SET commands during benchmark initialization. "
@@ -183,6 +220,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip profiling and run single test pass only. "
         "Overrides profiling_sets and config_sets from config file. "
         "Use for quick benchmarks or when profiling overhead is unwanted.",
+    )
+
+    parser.add_argument(
+        "--repository",
+        type=_validate_repository_format,
+        default=None,
+        help="GitHub repository in 'owner/repo' format (e.g., 'valkey-io/valkey'). "
+        "Used to generate commit links in comparison reports.",
     )
 
     parser.add_argument(
@@ -249,6 +294,54 @@ def _validate_cpu_range(value, key_name: str) -> None:
 # ---------- Helpers ----------------------------------------------------------
 
 
+def compile_simple_config(cfg: dict) -> None:
+    """Compile the basic 'commands' format into generated test_groups.
+
+    Each parameter combination becomes a single-scenario group, preserving
+    consecutive run ordering. The origin marker preserves the basic metrics
+    schema and shared seed. Cluster-specific filtering happens later, after
+    cluster mode has been scalarized.
+    """
+    requests_list = (
+        cfg["requests"] if cfg.get("requests") is not None else [None]
+    )  # duration mode has no requests
+
+    groups = []
+    for requests, keyspacelen, data_size, pipeline, clients, command in product(
+        requests_list,
+        cfg["keyspacelen"],
+        cfg["data_sizes"],
+        cfg["pipelines"],
+        cfg["clients"],
+        cfg["commands"],
+    ):
+        if command not in READ_COMMANDS + WRITE_COMMANDS:
+            logging.warning(f"Unsupported command: {command}, skipping.")
+            continue
+
+        scenario = {
+            ORIGIN_FIELD: ORIGIN_SIMPLE,
+            "id": command,
+            "test": command,
+            "data_size": data_size,
+            "pipeline": pipeline,
+            "clients": clients,
+            "keyspacelen": keyspacelen,
+            "warmup_inline": cfg["warmup"],
+            "restart_before": True,
+        }
+        if cfg.get("duration") is not None:
+            scenario["duration"] = cfg["duration"]
+        else:
+            scenario["requests"] = requests
+        if command in READ_COMMANDS:
+            scenario["populate_with"] = READ_POPULATE_MAP[command]
+
+        groups.append({"group": len(groups) + 1, "scenarios": [scenario]})
+
+    cfg["test_groups"] = groups
+
+
 def validate_config(cfg: dict) -> None:
     """Validate config (commands or test_groups format)."""
     if "scenarios" in cfg and "test_groups" not in cfg:
@@ -311,11 +404,30 @@ def validate_config(cfg: dict) -> None:
     if "port" in cfg:
         if not isinstance(cfg["port"], int) or cfg["port"] <= 0 or cfg["port"] > 65535:
             raise ValueError("'port' must be between 1 and 65535")
+    if "custom-server-configs" in cfg:
+        if not isinstance(cfg["custom-server-configs"], dict):
+            raise ValueError("'custom-server-configs' must be a dictionary")
+        for key, value in cfg["custom-server-configs"].items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"'custom-server-configs' keys must be strings, got: {type(key)}"
+                )
+            # Note: bool is a subclass of int in Python, so check bool first.
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError(
+                    f"'custom-server-configs' values must be strings or numbers, got: {type(value)}"
+                )
+    if "custom-server-config-file" in cfg:
+        if not isinstance(cfg["custom-server-config-file"], str):
+            raise ValueError("'custom-server-config-file' must be a string path")
 
     if "cluster_mode" in cfg and not isinstance(cfg["cluster_mode"], list):
         cfg["cluster_mode"] = parse_bool(cfg["cluster_mode"])
     if "tls_mode" in cfg:
         cfg["tls_mode"] = parse_bool(cfg["tls_mode"])
+
+    if has_commands and not has_test_groups:
+        compile_simple_config(cfg)
 
 
 def load_configs(path: str) -> List[dict]:
@@ -424,6 +536,48 @@ def validate_test_groups(cfg: dict) -> None:
         if not isinstance(group["scenarios"], list) or len(group["scenarios"]) == 0:
             raise ValueError(f"test_groups[{i}].scenarios must be a non-empty list")
 
+        for j, scenario in enumerate(group["scenarios"]):
+            if not isinstance(scenario, dict):
+                raise ValueError(f"test_groups[{i}].scenarios[{j}] must be a dict")
+
+            if scenario.get("type") == "mixed":
+                if "populate_with" in scenario:
+                    raise ValueError(
+                        f"test_groups[{i}].scenarios[{j}] combines 'mixed' "
+                        "with 'populate_with'; mixed scenarios seed the "
+                        "keyspace through their own 'writes' sub-scenarios"
+                    )
+                continue
+
+            if ("test" in scenario) == ("command" in scenario):
+                raise ValueError(
+                    f"test_groups[{i}].scenarios[{j}] must have exactly one "
+                    "of 'test' or 'command'"
+                )
+
+            if "test" in scenario and "options" in scenario:
+                raise ValueError(
+                    f"test_groups[{i}].scenarios[{j}] combines 'test' with "
+                    "'options'; options append flags to the command string "
+                    "and are only valid with 'command', not 'test'"
+                )
+
+            if "populate_with" in scenario:
+                populate_with = scenario["populate_with"]
+                if not isinstance(populate_with, str) or not populate_with:
+                    raise ValueError(
+                        f"test_groups[{i}].scenarios[{j}] 'populate_with' must "
+                        "be a non-empty string"
+                    )
+                # Predefined tests require a supported write workload; command
+                # scenarios may use arbitrary populate commands.
+                if "test" in scenario and populate_with not in WRITE_COMMANDS:
+                    raise ValueError(
+                        f"test_groups[{i}].scenarios[{j}] 'populate_with' "
+                        f"{populate_with!r} is not a supported write command; "
+                        f"for a 'test' scenario it must be one of {WRITE_COMMANDS}"
+                    )
+
 
 def run_benchmark_matrix(
     *,
@@ -431,7 +585,9 @@ def run_benchmark_matrix(
     cfg: dict,
     args: argparse.Namespace,
     module_path: Optional[str] = None,
-    uses_test_groups: bool = False,
+    config_name: Optional[str] = None,
+    module_commit: Optional[str] = None,
+    module_commit_timestamp: Optional[str] = None,
 ) -> None:
     """Orchestrate benchmark execution for all configurations."""
     if args.module:
@@ -455,7 +611,10 @@ def run_benchmark_matrix(
     )
     if not args.use_running_server:
         server_binary = valkey_dir / "src" / "valkey-server"
-        if server_binary.exists():
+        if args.valkey_path and commit_id != "HEAD":
+            # Shared directory with explicit commit: checkout and rebuild
+            builder.build()
+        elif server_binary.exists():
             logging.info("Using existing valkey-server binary")
         else:
             logging.info("valkey-server binary not found, building...")
@@ -475,10 +634,13 @@ def run_benchmark_matrix(
             args,
             results_dir,
             valkey_dir,
+            commit_id,
             module_path,
-            uses_test_groups,
             architecture,
             client_cpu_ranges,
+            config_name,
+            module_commit,
+            module_commit_timestamp,
         )
 
     # Cleanup
@@ -545,10 +707,13 @@ def _execute_benchmark_run(
     args,
     results_dir,
     valkey_dir,
+    commit_id,
     module_path,
-    uses_test_groups,
     architecture,
     client_cpu_ranges,
+    config_name=None,
+    module_commit=None,
+    module_commit_timestamp=None,
 ):
     """Execute a single benchmark run with specific configuration."""
     cfg = exec_config["cfg"]
@@ -583,7 +748,13 @@ def _execute_benchmark_run(
 
     # Apply config set
     if exec_config["config_set"] and not args.skip_config_set:
-        _apply_config_to_servers(exec_config["config_set"], cfg, args.target_ip)
+        apply_config_to_servers(
+            exec_config["config_set"],
+            _get_active_ports(cfg),
+            args.target_ip,
+            tls_mode=cfg.get("tls_mode", False),
+            valkey_dir=valkey_dir,
+        )
 
     # Run benchmark client
     if args.mode in ("client", "both"):
@@ -600,7 +771,7 @@ def _execute_benchmark_run(
             logging.info(f"Built valkey-benchmark: {benchmark_path}")
 
         runner = ClientRunner(
-            commit_id=exec_config["cfg"].get("commit_id", "HEAD"),
+            commit_id=commit_id,
             config=cfg,
             cluster_mode=cfg["cluster_mode"],
             tls_mode=cfg["tls_mode"],
@@ -614,7 +785,10 @@ def _execute_benchmark_run(
             runs=args.runs,
             server_launcher=launcher,
             architecture=architecture,
-            uses_test_groups=uses_test_groups,
+            repository=args.repository,
+            config_name=config_name,
+            module_commit=module_commit,
+            module_commit_timestamp=module_commit_timestamp,
         )
 
         runner.current_profiling_set = exec_config["profiling_set"]
@@ -630,20 +804,6 @@ def _execute_benchmark_run(
     # Shutdown server
     if launcher and not args.use_running_server:
         launcher.shutdown(cfg["tls_mode"])
-
-
-def _apply_config_to_servers(config_set: dict, cfg: dict, target_ip: str) -> None:
-    """Apply CONFIG SET commands to all server nodes."""
-    import valkey
-
-    for port in _get_active_ports(cfg):
-        client = valkey.Valkey(host=target_ip, port=port)
-        try:
-            for k, v in config_set.items():
-                client.execute_command("CONFIG", "SET", k, str(v))
-                logging.info(f"Set {k} = {v} on port {port}")
-        finally:
-            client.close()
 
 
 def get_module_binary_path(args: argparse.Namespace, config: dict) -> Optional[str]:
@@ -693,6 +853,13 @@ def main() -> None:
         sys.exit(1)
 
     # Load and validate configs
+    if args.config is None:
+        args.config = DEFAULT_CONFIG_FILE
+        print(
+            f"WARNING: --config not specified, using default: '{DEFAULT_CONFIG_FILE}'",
+            file=sys.stderr,
+        )
+
     configs_list = load_configs(args.config)
 
     if not configs_list:
@@ -703,8 +870,6 @@ def main() -> None:
     config = configs_list[0]
     validate_cpu_allocation(config)
 
-    uses_test_groups = "test_groups" in config
-
     module_path = get_module_binary_path(args, config)
 
     # Module testing requires valkey-path
@@ -712,9 +877,8 @@ def main() -> None:
         print("ERROR: Module testing requires --valkey-path")
         sys.exit(1)
 
-    if uses_test_groups and (
-        config.get("dataset_generation") or config.get("query_generation")
-    ):
+    # Every validated config has test_groups (basic configs are compiled)
+    if config.get("dataset_generation") or config.get("query_generation"):
         import subprocess
 
         required_datasets = set()
@@ -755,7 +919,6 @@ def main() -> None:
     # Process all configs
     for cfg in configs_list:
         validate_cpu_allocation(cfg)
-        uses_test_groups = "test_groups" in cfg
 
         # Apply CLI filters to this config
         if args.groups:
@@ -770,7 +933,9 @@ def main() -> None:
                 cfg=cfg,
                 args=args,
                 module_path=module_path,
-                uses_test_groups=uses_test_groups,
+                config_name=Path(args.config).name if args.module else None,
+                module_commit=args.module_commit,
+                module_commit_timestamp=args.module_commit_timestamp,
             )
 
 

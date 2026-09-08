@@ -5,14 +5,56 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 import valkey
 
 # Constants
 VALKEY_SERVER = "src/valkey-server"
 DEFAULT_PORT = 6379
-DEFAULT_TIMEOUT = 15
+DEFAULT_TIMEOUT = 30
+
+
+def apply_config_to_servers(
+    config_set: dict,
+    ports: List[int],
+    target_ip: str,
+    tls_mode: bool = False,
+    valkey_dir: Optional[Path] = None,
+) -> None:
+    """Apply CONFIG SET commands to all server nodes.
+
+    Args:
+        config_set: Dict of config key-value pairs to set.
+        ports: List of server ports to apply config to.
+        target_ip: Host IP of the server(s).
+        tls_mode: Whether to connect with TLS.
+        valkey_dir: Path to valkey directory (needed for TLS cert paths).
+    """
+    kwargs_base = {"decode_responses": True, "socket_timeout": 30}
+    if tls_mode:
+        if valkey_dir is None:
+            raise ValueError("valkey_dir is required when tls_mode is True")
+        tls_cert_path = Path(valkey_dir) / "tests" / "tls"
+        if not tls_cert_path.exists():
+            raise FileNotFoundError(f"TLS certificates not found at {tls_cert_path}")
+        kwargs_base.update(
+            {
+                "ssl": True,
+                "ssl_certfile": str(tls_cert_path / "valkey.crt"),
+                "ssl_keyfile": str(tls_cert_path / "valkey.key"),
+                "ssl_ca_certs": str(tls_cert_path / "ca.crt"),
+            }
+        )
+
+    for port in ports:
+        client = valkey.Valkey(host=target_ip, port=port, **kwargs_base)
+        try:
+            for k, v in config_set.items():
+                client.execute_command("CONFIG", "SET", k, str(v))
+                logging.info(f"Set {k} = {v} on port {port}")
+        finally:
+            client.close()
 
 
 class ServerLauncher:
@@ -40,8 +82,8 @@ class ServerLauncher:
             "host": host,
             "port": port,
             "decode_responses": True,
-            "socket_timeout": 5,
-            "socket_connect_timeout": 5,
+            "socket_timeout": 30,
+            "socket_connect_timeout": 30,
         }
         if tls_mode:
             tls_cert_path = Path(self.valkey_path) / "tests" / "tls"
@@ -136,6 +178,16 @@ class ServerLauncher:
 
         cmd.append(VALKEY_SERVER)
 
+        # Optional positional config file (must come right after the binary,
+        # before any --flag args). Subsequent --flag values override file values.
+        custom_conf_file = (
+            (self.config or {}).get("custom-server-config-file")
+            if hasattr(self, "config")
+            else None
+        )
+        if custom_conf_file:
+            cmd.append(custom_conf_file)
+
         # Port and TLS configuration
         if tls_mode:
             cmd += ["--tls-port", str(port), "--port", "0"]
@@ -169,7 +221,20 @@ class ServerLauncher:
             if not bind_ip:
                 cmd += ["--cluster-announce-ip", self.target_ip]
 
-        # Common server configuration
+        # Apply custom-server-configs from benchmark config. These are added
+        # BEFORE the benchmark defaults block so that, by valkey CLI last-wins
+        # semantics, the harness's defaults always take precedence over any
+        # user-supplied value for the same key.
+        custom_configs = (
+            (self.config or {}).get("custom-server-configs")
+            if hasattr(self, "config")
+            else None
+        )
+        if custom_configs:
+            for key, value in custom_configs.items():
+                cmd += [f"--{key}", str(value)]
+
+        # Common server configuration (benchmark defaults — always win).
         cmd += [
             "--cluster-enabled",
             "yes" if cluster_mode else "no",
@@ -188,6 +253,40 @@ class ServerLauncher:
         ]
 
         return cmd
+
+    def _wait_for_port_available(
+        self, port: int = DEFAULT_PORT, timeout: int = 60
+    ) -> None:
+        """Wait until the TCP port is free (not in TIME_WAIT/LISTEN).
+
+        After SIGKILL, the kernel may hold the socket in TIME_WAIT for up to 60s.
+        This method blocks until the port is available for binding.
+        """
+        logging.info(f"Waiting for port {port} to become available...")
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                result = subprocess.run(
+                    ["ss", "-tlnp", f"sport = :{port}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                # If no lines with the port in LISTEN state, port is free
+                lines = [l for l in result.stdout.strip().split("\n")[1:] if l.strip()]
+                if not lines:
+                    elapsed = time.time() - start
+                    if elapsed > 1:
+                        logging.info(f"Port {port} available after {elapsed:.1f}s")
+                    return
+            except Exception as e:
+                logging.warning(f"Error checking port availability: {e}")
+            time.sleep(1)
+
+        logging.warning(
+            f"Port {port} still not available after {timeout}s. "
+            f"Proceeding anyway (server may fail to bind)."
+        )
 
     def _wait_for_server_ready(
         self, tls_mode: bool, timeout: int = DEFAULT_TIMEOUT
@@ -427,6 +526,8 @@ class ServerLauncher:
         """Launch Valkey server and setup cluster if needed."""
         self.config = config
         self.module_path = module_path
+        # Reset node tracking so a restart doesn't accumulate stale entries
+        self.cluster_nodes = []
 
         # Setup modules: CLI overrides config path
         if module_path:
@@ -528,70 +629,82 @@ class ServerLauncher:
             except Exception as e:
                 logging.warning(f"Could not send shutdown command: {e}")
 
-        # Fallback: kill any remaining processes
-        try:
-            subprocess.run(["pkill", "-f", VALKEY_SERVER], timeout=10, check=False)
-        except Exception as e:
-            logging.debug(f"pkill fallback failed: {e}")
-
-        # Wait for all processes to stop
+        # Wait for all processes to stop (escalates to SIGKILL if needed)
         self._wait_for_process_shutdown()
 
-    def _wait_for_process_shutdown(self, timeout: int = 10) -> None:
-        """Wait for Valkey server process to fully terminate."""
+    def _valkey_processes_running(self) -> bool:
+        """Check if any valkey-server processes are running."""
+        return bool(self._get_valkey_pids())
+
+    def _get_valkey_pids(self) -> List[str]:
+        """Get PIDs of running valkey-server processes."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", VALKEY_SERVER],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split("\n")
+        except Exception:
+            pass
+        return []
+
+    def _wait_for_process_shutdown(self, timeout: int = 30) -> None:
+        """Wait for Valkey server process to fully terminate, force-kill if needed."""
         logging.info("Waiting for Valkey server process to terminate...")
         start_time = time.time()
 
         while time.time() - start_time < timeout:
-            try:
-                # Check if any valkey-server processes are still running
-                result = subprocess.run(
-                    ["ps", "aux"], capture_output=True, text=True, timeout=5
-                )
+            if not self._valkey_processes_running():
+                logging.info("Valkey server process has terminated successfully.")
+                return
+            time.sleep(0.5)
 
-                # Filter for valkey-server processes (excluding grep itself)
-                valkey_processes = []
-                for line in result.stdout.splitlines():
-                    if "valkey-server" in line and "grep" not in line:
-                        valkey_processes.append(line.strip())
-
-                if not valkey_processes:
-                    logging.info("Valkey server process has terminated successfully.")
-                    return
-
-                # Log found processes for debugging
-                logging.info(
-                    f"Found {len(valkey_processes)} valkey-server process(es) still running:"
-                )
-                for proc in valkey_processes:
-                    logging.info(f"  {proc}")
-
-                time.sleep(0.5)
-
-            except subprocess.TimeoutExpired:
-                logging.warning("Process check timed out, continuing to wait...")
-                time.sleep(0.5)
-            except Exception as e:
-                logging.warning(f"Error checking process status: {e}")
-                time.sleep(0.5)
-
-        # Timeout reached - log warning but don't fail
-        elapsed = time.time() - start_time
-        logging.warning(f"Process shutdown verification timed out after {elapsed:.1f}s")
-
-        # Final check to log any remaining processes
+        # Timeout reached - escalate: SIGTERM first (graceful), then SIGKILL
+        remaining_pids = self._get_valkey_pids()
+        logging.warning(
+            f"Process shutdown timed out after {timeout}s. "
+            f"Sending SIGTERM to PIDs: {remaining_pids}"
+        )
         try:
-            result = subprocess.run(
-                ["ps", "aux"], capture_output=True, text=True, timeout=5
-            )
-            remaining_processes = [
-                line.strip()
-                for line in result.stdout.splitlines()
-                if "valkey-server" in line and "grep" not in line
-            ]
-            if remaining_processes:
-                logging.warning("Remaining valkey-server processes:")
-                for proc in remaining_processes:
-                    logging.warning(f"  {proc}")
+            subprocess.run(["pkill", "-f", VALKEY_SERVER], timeout=5, check=False)
         except Exception as e:
-            logging.warning(f"Could not perform final process check: {e}")
+            logging.warning(f"SIGTERM via pkill failed: {e}")
+
+        # Wait up to 5 seconds for SIGTERM to take effect
+        term_deadline = time.time() + 5
+        while time.time() < term_deadline:
+            if not self._valkey_processes_running():
+                logging.info("Valkey server terminated after SIGTERM.")
+                return
+            time.sleep(0.5)
+
+        # SIGTERM didn't work - escalate to SIGKILL
+        remaining_pids = self._get_valkey_pids()
+        logging.warning(
+            f"SIGTERM ineffective. Sending SIGKILL to PIDs: {remaining_pids}"
+        )
+        try:
+            subprocess.run(["pkill", "-9", "-f", VALKEY_SERVER], timeout=5, check=False)
+        except Exception as e:
+            logging.warning(f"SIGKILL via pkill failed: {e}")
+
+        # Wait up to 5 more seconds for SIGKILL to take effect
+        kill_deadline = time.time() + 5
+        while time.time() < kill_deadline:
+            if not self._valkey_processes_running():
+                logging.info("Valkey server terminated after SIGKILL.")
+                # After SIGKILL, port may be in TIME_WAIT - wait for it
+                self._wait_for_port_available()
+                return
+            time.sleep(0.5)
+
+        # If still alive after SIGKILL, something is very wrong
+        still_alive = self._get_valkey_pids()
+        if still_alive:
+            logging.error(
+                f"CRITICAL: valkey-server PIDs {still_alive} still alive after SIGKILL!"
+            )
+            raise RuntimeError(f"Cannot kill valkey-server processes: {still_alive}")

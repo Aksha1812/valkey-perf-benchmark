@@ -12,11 +12,15 @@ import sys
 from typing import Dict, List, Tuple, Any, Optional
 from pathlib import Path
 
+import math
+
+from scipy import stats
+from uncertainties import ufloat
+
 # Optional dependencies for graphing functionality
 try:
     import matplotlib.pyplot as plt
     import numpy as np
-    from scipy import stats
     from matplotlib.ticker import FuncFormatter
 
     GRAPHING_AVAILABLE = True
@@ -24,8 +28,11 @@ except ImportError:
     GRAPHING_AVAILABLE = False
     plt = None
     np = None
-    stats = None
     FuncFormatter = None
+
+# Shared by all CI/PI calculations and labels.
+CONFIDENCE_LEVEL = 0.95
+CONFIDENCE_PERCENT = int(CONFIDENCE_LEVEL * 100)
 
 
 def load_benchmark_data(path: str) -> List[Dict[str, Any]]:
@@ -56,18 +63,9 @@ def calculate_stdev(values: List[float]) -> float:
 
 
 def calculate_confidence_interval(
-    values: List[float], confidence_level: float = 0.99
+    values: List[float], confidence_level: float = CONFIDENCE_LEVEL
 ) -> Tuple[float, float]:
-    """
-    Calculate confidence interval for a list of values using t-distribution.
-
-    Args:
-        values: List of numeric values
-        confidence_level: Confidence level (default 0.99 for 99% CI)
-
-    Returns:
-        Tuple of (lower_bound, upper_bound) or (0.0, 0.0) if insufficient data
-    """
+    """Return a t-distribution confidence interval, or zeros for fewer than 2 values."""
     filtered_values = [v for v in values if v is not None]
     n = len(filtered_values)
 
@@ -77,40 +75,19 @@ def calculate_confidence_interval(
     mean_val = statistics.mean(filtered_values)
     stdev_val = statistics.stdev(filtered_values)
 
-    # Calculate standard error
     standard_error = stdev_val / (n**0.5)
 
-    if GRAPHING_AVAILABLE and stats:
-        # Use stats.t.interval for direct confidence interval calculation
-        degrees_of_freedom = n - 1
-        lower_bound, upper_bound = stats.t.interval(
-            confidence_level, degrees_of_freedom, loc=mean_val, scale=standard_error
-        )
-        return (lower_bound, upper_bound)
-    else:
-        # Fallback: use normal approximation for large samples or simple approximation
-        # For 99% confidence level, use z ≈ 2.576 (normal approximation)
-        z_score = 2.576 if confidence_level >= 0.99 else 1.96  # 95% fallback
-        margin_of_error = z_score * standard_error
-        return (mean_val - margin_of_error, mean_val + margin_of_error)
+    degrees_of_freedom = n - 1
+    lower_bound, upper_bound = stats.t.interval(
+        confidence_level, degrees_of_freedom, loc=mean_val, scale=standard_error
+    )
+    return (lower_bound, upper_bound)
 
 
 def calculate_prediction_interval(
-    values: List[float], confidence_level: float = 0.99
+    values: List[float], confidence_level: float = CONFIDENCE_LEVEL
 ) -> Tuple[float, float]:
-    """
-    Calculate prediction interval for a single future observation using t-distribution.
-
-    Uses SciPy's t-distribution functions for accurate statistical calculations.
-    Reference: https://en.wikipedia.org/wiki/Student%27s_t-distribution#Prediction_interval
-
-    Args:
-        values: List of numeric values
-        confidence_level: Confidence level (default 0.99 for 99% PI)
-
-    Returns:
-        Tuple of (lower_bound, upper_bound) or (0.0, 0.0) if insufficient data
-    """
+    """Return a t prediction interval, or zeros for fewer than 2 values."""
     filtered_values = [v for v in values if v is not None]
     n = len(filtered_values)
 
@@ -120,39 +97,19 @@ def calculate_prediction_interval(
     mean_val = statistics.mean(filtered_values)
     stdev_val = statistics.stdev(filtered_values)
 
-    if GRAPHING_AVAILABLE and stats:
-        # Uses SciPy's t-distribution with prediction interval scaling factor
-        # Prediction interval accounts for both sampling uncertainty and future observation variability
-        degrees_of_freedom = n - 1
-        prediction_scale = (
-            stdev_val * (1 + 1 / n) ** 0.5
-        )  # Standard prediction interval scaling
+    degrees_of_freedom = n - 1
+    prediction_scale = stdev_val * (1 + 1 / n) ** 0.5
 
-        lower_bound, upper_bound = stats.t.interval(
-            confidence_level, degrees_of_freedom, loc=mean_val, scale=prediction_scale
-        )
-        return (lower_bound, upper_bound)
-    else:
-        # Fallback: use normal approximation with prediction interval scaling
-        prediction_error = stdev_val * (1 + 1 / n) ** 0.5
-        z_score = 2.576 if confidence_level >= 0.99 else 1.96  # 95% fallback
-        margin_of_error = z_score * prediction_error
-        return (mean_val - margin_of_error, mean_val + margin_of_error)
+    lower_bound, upper_bound = stats.t.interval(
+        confidence_level, degrees_of_freedom, loc=mean_val, scale=prediction_scale
+    )
+    return (lower_bound, upper_bound)
 
 
 def calculate_prediction_interval_percentage(
-    values: List[float], confidence_level: float = 0.99
+    values: List[float], confidence_level: float = CONFIDENCE_LEVEL
 ) -> float:
-    """
-    Calculate prediction interval as a percentage of the mean value.
-
-    Args:
-        values: List of numeric values
-        confidence_level: Confidence level (default 0.99 for 99% PI)
-
-    Returns:
-        Prediction interval as percentage of mean (±X%), or 0.0 if insufficient data
-    """
+    """Return the prediction-interval margin as a percentage of the mean."""
     filtered_values = [v for v in values if v is not None]
     n = len(filtered_values)
 
@@ -165,38 +122,20 @@ def calculate_prediction_interval_percentage(
 
     stdev_val = statistics.stdev(filtered_values)
 
-    # Prediction interval uses sqrt(1 + 1/n) factor
     prediction_error = stdev_val * (1 + 1 / n) ** 0.5
 
-    if GRAPHING_AVAILABLE and stats:
-        degrees_of_freedom = n - 1
-        alpha = 1 - confidence_level
-        t_critical = stats.t.ppf(1 - alpha / 2, degrees_of_freedom)
-        margin_of_error = t_critical * prediction_error
-    else:
-        # Fallback: use normal approximation
-        z_score = 2.576 if confidence_level >= 0.99 else 1.96  # 95% fallback
-        margin_of_error = z_score * prediction_error
+    degrees_of_freedom = n - 1
+    alpha = 1 - confidence_level
+    t_critical = stats.t.ppf(1 - alpha / 2, degrees_of_freedom)
+    margin_of_error = t_critical * prediction_error
 
-    # Calculate PI as percentage of mean
-    pi_percentage = (margin_of_error / mean_val) * 100.0
-
-    return pi_percentage
+    return (margin_of_error / mean_val) * 100.0
 
 
 def calculate_confidence_interval_percentage(
-    values: List[float], confidence_level: float = 0.99
+    values: List[float], confidence_level: float = CONFIDENCE_LEVEL
 ) -> float:
-    """
-    Calculate confidence interval as a percentage of the mean value.
-
-    Args:
-        values: List of numeric values
-        confidence_level: Confidence level (default 0.99 for 99% CI)
-
-    Returns:
-        Confidence interval as percentage of mean (±X%), or 0.0 if insufficient data
-    """
+    """Return the confidence-interval margin as a percentage of the mean."""
     filtered_values = [v for v in values if v is not None]
     n = len(filtered_values)
 
@@ -207,35 +146,21 @@ def calculate_confidence_interval_percentage(
     if mean_val == 0.0:
         return 0.0
 
-    # Use the existing calculate_confidence_interval function
     ci_lower, ci_upper = calculate_confidence_interval(values, confidence_level)
-
-    # If confidence interval calculation failed, return 0.0
     if ci_lower == 0.0 and ci_upper == 0.0:
         return 0.0
-
-    # Calculate margin of error from the confidence interval bounds
     margin_of_error = (ci_upper - ci_lower) / 2.0
-
-    # Calculate CI as percentage of mean
-    ci_percentage = (margin_of_error / mean_val) * 100.0
-
-    return ci_percentage
+    return (margin_of_error / mean_val) * 100.0
 
 
-def discover_config_keys(data: List[Dict[str, Any]]) -> List[str]:
-    """
-    Dynamically discover configuration keys from benchmark data.
-
-    Excludes performance metrics and metadata fields, keeping only
-    configuration parameters that define test scenarios.
-    """
-    config_keys = set()
-
-    # Fields that are metrics or metadata, not configuration
-    excluded_fields = {
+# Metrics and run metadata excluded from both grouping and scenario identity.
+_CONFIG_EXCLUDED_FIELDS = frozenset(
+    {
         "timestamp",
         "commit",
+        "module_commit",
+        "module_commit_timestamp",
+        "repository",
         "run_count",
         # Performance metrics
         "rps",
@@ -245,10 +170,6 @@ def discover_config_keys(data: List[Dict[str, Any]]) -> List[str]:
         "p95_latency_ms",
         "p99_latency_ms",
         "max_latency_ms",
-        "latency_avg_ms",
-        "latency_p50_ms",
-        "latency_p95_ms",
-        "latency_p99_ms",
         # Standard deviation fields
         "rps_stdev",
         "avg_latency_ms_stdev",
@@ -294,20 +215,52 @@ def discover_config_keys(data: List[Dict[str, Any]]) -> List[str]:
         "p99_latency_ms_pi_upper",
         "p99_latency_ms_pi_percent",
     }
+)
+
+# Failure state and display-only fields do not identify a scenario. In particular,
+# success and failure rows may use different command labels.
+_NON_IDENTITY_FIELDS = _CONFIG_EXCLUDED_FIELDS | {
+    "status",
+    "error",
+    "command",
+    "group_description",
+    "scenario_description",
+}
+
+# Live readings may differ between compatible runs. Unknown environment fields
+# remain identity axes so new compatibility metadata is conservative by default.
+_VOLATILE_ENV_FIELDS = frozenset({"env_cpu_freq_mhz_at_setup"})
+
+
+def discover_config_keys(data: List[Dict[str, Any]]) -> List[str]:
+    """
+    Dynamically discover configuration keys from benchmark data.
+
+    Excludes performance metrics and metadata fields, keeping only
+    configuration parameters that define test scenarios.
+    """
+    config_keys = set()
 
     for item in data:
         for key, value in item.items():
-            if key not in excluded_fields:
+            if key not in _CONFIG_EXCLUDED_FIELDS and key not in _VOLATILE_ENV_FIELDS:
                 # Only include keys with hashable values for grouping
                 if isinstance(value, (str, int, float, bool, type(None))):
                     config_keys.add(key)
 
-    return sorted(config_keys)
+    # Sort with test_id first (if present) for natural test ordering
+    sorted_keys = sorted(config_keys)
+    if "test_id" in sorted_keys:
+        sorted_keys.remove("test_id")
+        sorted_keys.insert(0, "test_id")
+    return sorted_keys
 
 
 def create_config_signature(item: Dict[str, Any], config_keys: List[str]) -> Tuple:
-    """Create a configuration signature tuple for grouping identical configurations."""
-    return tuple(item.get(key) for key in config_keys)
+    """Build a scalar signature plus a frozen ``config_set`` sweep value."""
+    config_set = item.get("config_set")
+    frozen_config_set = _make_hashable(config_set) if config_set else None
+    return tuple(item.get(key) for key in config_keys) + (frozen_config_set,)
 
 
 def group_by_command(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -322,81 +275,58 @@ def group_by_command(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, An
 
 
 def summarize_benchmark_results(data_items: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Calculate summary statistics for a group of benchmark results.
-
-    Handles both old and new field naming conventions for latency metrics.
-    """
+    """Calculate summary statistics for a group of benchmark results."""
     if not data_items:
         return {
             "rps": 0.0,
-            "latency_avg_ms": 0.0,
-            "latency_p50_ms": 0.0,
-            "latency_p95_ms": 0.0,
-            "latency_p99_ms": 0.0,
+            "avg_latency_ms": 0.0,
+            "p50_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
+            "p99_latency_ms": 0.0,
         }
 
-    # Extract values with fallback for different field names
     rps_values = [item.get("rps", 0.0) for item in data_items]
-
-    avg_latency_values = [
-        item.get("avg_latency_ms", item.get("latency_avg_ms", 0.0))
-        for item in data_items
-    ]
-
-    p50_latency_values = [
-        item.get("p50_latency_ms", item.get("latency_p50_ms", 0.0))
-        for item in data_items
-    ]
-
-    p95_latency_values = [
-        item.get("p95_latency_ms", item.get("latency_p95_ms", 0.0))
-        for item in data_items
-    ]
-
-    p99_latency_values = [
-        item.get("p99_latency_ms", item.get("latency_p99_ms", 0.0))
-        for item in data_items
-    ]
+    avg_latency_values = [item.get("avg_latency_ms", 0.0) for item in data_items]
+    p50_latency_values = [item.get("p50_latency_ms", 0.0) for item in data_items]
+    p95_latency_values = [item.get("p95_latency_ms", 0.0) for item in data_items]
+    p99_latency_values = [item.get("p99_latency_ms", 0.0) for item in data_items]
 
     return {
         "rps": calculate_mean(rps_values),
-        "latency_avg_ms": calculate_mean(avg_latency_values),
-        "latency_p50_ms": calculate_mean(p50_latency_values),
-        "latency_p95_ms": calculate_mean(p95_latency_values),
-        "latency_p99_ms": calculate_mean(p99_latency_values),
+        "avg_latency_ms": calculate_mean(avg_latency_values),
+        "p50_latency_ms": calculate_mean(p50_latency_values),
+        "p95_latency_ms": calculate_mean(p95_latency_values),
+        "p99_latency_ms": calculate_mean(p99_latency_values),
     }
 
 
-def average_multiple_runs(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Automatically average multiple benchmark runs with identical configurations.
-
-    Groups runs by configuration parameters and calculates means and standard deviations
-    for performance metrics. Always applied to ensure consistent comparisons.
-    """
+def average_multiple_runs(
+    data: List[Dict[str, Any]],
+    shared_config_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Average runs with identical signatures using optional shared config keys."""
     if not data:
         return []
 
-    # Get configuration keys (excluding metrics and metadata)
+    base_keys = (
+        shared_config_keys
+        if shared_config_keys is not None
+        else discover_config_keys(data)
+    )
     config_keys = [
         key
-        for key in discover_config_keys(data)
+        for key in base_keys
         if key not in ["timestamp", "run_count"] and not key.endswith("_stdev")
     ]
 
-    # Group runs by identical configurations
     grouped_runs = {}
     for item in data:
         config_signature = create_config_signature(item, config_keys)
-        if config_signature not in grouped_runs:
-            grouped_runs[config_signature] = []
-        grouped_runs[config_signature].append(item)
+        grouped_runs.setdefault(config_signature, []).append(item)
 
     # Process each configuration group
     averaged_results = []
     for config_signature, runs in grouped_runs.items():
-        # Create base configuration item
         averaged_item = dict(zip(config_keys, config_signature))
         averaged_item["run_count"] = len(runs)
 
@@ -415,28 +345,14 @@ def average_multiple_runs(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             )
             averaged_results.append(single_run)
         else:
-            # Multiple runs: calculate averages and standard deviations
             metric_values = {
                 "rps": [run.get("rps", 0.0) for run in runs],
-                "avg_latency_ms": [
-                    run.get("avg_latency_ms", run.get("latency_avg_ms", 0.0))
-                    for run in runs
-                ],
-                "p50_latency_ms": [
-                    run.get("p50_latency_ms", run.get("latency_p50_ms", 0.0))
-                    for run in runs
-                ],
-                "p95_latency_ms": [
-                    run.get("p95_latency_ms", run.get("latency_p95_ms", 0.0))
-                    for run in runs
-                ],
-                "p99_latency_ms": [
-                    run.get("p99_latency_ms", run.get("latency_p99_ms", 0.0))
-                    for run in runs
-                ],
+                "avg_latency_ms": [run.get("avg_latency_ms", 0.0) for run in runs],
+                "p50_latency_ms": [run.get("p50_latency_ms", 0.0) for run in runs],
+                "p95_latency_ms": [run.get("p95_latency_ms", 0.0) for run in runs],
+                "p99_latency_ms": [run.get("p99_latency_ms", 0.0) for run in runs],
             }
 
-            # Calculate means, standard deviations, coefficient of variation, and confidence intervals
             for metric, values in metric_values.items():
                 mean_val = calculate_mean(values)
                 stdev_val = calculate_stdev(values)
@@ -444,28 +360,23 @@ def average_multiple_runs(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 averaged_item[metric] = mean_val
                 averaged_item[f"{metric}_stdev"] = stdev_val
 
-                # Calculate CV directly from already computed mean and stdev
                 if mean_val == 0.0 or stdev_val == 0.0:
                     averaged_item[f"{metric}_cv"] = 0.0
                 else:
                     averaged_item[f"{metric}_cv"] = (stdev_val / mean_val) * 100.0
 
-                # Calculate 99% confidence interval
-                ci_lower, ci_upper = calculate_confidence_interval(values, 0.99)
+                ci_lower, ci_upper = calculate_confidence_interval(values)
                 averaged_item[f"{metric}_ci_lower"] = ci_lower
                 averaged_item[f"{metric}_ci_upper"] = ci_upper
 
-                # Calculate confidence interval as percentage of mean
-                ci_percentage = calculate_confidence_interval_percentage(values, 0.99)
+                ci_percentage = calculate_confidence_interval_percentage(values)
                 averaged_item[f"{metric}_ci_percent"] = ci_percentage
 
-                # Calculate 99% prediction interval
-                pi_lower, pi_upper = calculate_prediction_interval(values, 0.99)
+                pi_lower, pi_upper = calculate_prediction_interval(values)
                 averaged_item[f"{metric}_pi_lower"] = pi_lower
                 averaged_item[f"{metric}_pi_upper"] = pi_upper
 
-                # Calculate prediction interval as percentage of mean
-                pi_percentage = calculate_prediction_interval_percentage(values, 0.99)
+                pi_percentage = calculate_prediction_interval_percentage(values)
                 averaged_item[f"{metric}_pi_percent"] = pi_percentage
 
             # Preserve the most recent timestamp and commit
@@ -473,12 +384,25 @@ def average_multiple_runs(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if timestamps:
                 averaged_item["timestamp"] = max(timestamps)
 
-            # Preserve commit information from any run (they should all be the same)
             commits = [run.get("commit") for run in runs if run.get("commit")]
             if commits:
-                averaged_item["commit"] = commits[
-                    0
-                ]  # Use first commit (should be same for all runs)
+                averaged_item["commit"] = commits[0]
+
+            module_commits = [
+                run.get("module_commit") for run in runs if run.get("module_commit")
+            ]
+            if module_commits:
+                averaged_item["module_commit"] = module_commits[0]
+
+            repositories = [
+                run.get("repository") for run in runs if run.get("repository")
+            ]
+            if repositories:
+                averaged_item["repository"] = repositories[0]
+
+            # ``config_set`` is frozen outside ``config_keys``; retain its raw form.
+            if "config_set" in runs[0]:
+                averaged_item["config_set"] = runs[0]["config_set"]
 
             averaged_results.append(averaged_item)
 
@@ -493,11 +417,7 @@ def calculate_percentage_change(new_value: float, old_value: float) -> float:
 
 
 def create_config_sort_key(config_tuple: Tuple) -> Tuple[str, ...]:
-    """
-    Create a sorting key for configuration tuples that handles None values and mixed types.
-
-    Converts all values to strings for consistent comparison, with None values sorting first.
-    """
+    """Normalize mixed configuration values into a sortable string tuple."""
 
     def normalize_value(value):
         return "" if value is None else str(value)
@@ -509,14 +429,20 @@ def extract_version_identifier(data: List[Dict[str, Any]]) -> str:
     """
     Extract a version identifier from benchmark data.
 
-    Prioritizes commit hash, falls back to a short timestamp format, or returns "Unknown".
+    Prioritizes module_commit (for module benchmarks), then commit hash,
+    falls back to a short timestamp format, or returns "Unknown".
     """
     if not data:
         return "Unknown"
 
     first_item = data[0]
 
-    # Try commit hash first
+    # Try module_commit first (module benchmarks)
+    module_commit = first_item.get("module_commit")
+    if module_commit:
+        return module_commit if len(module_commit) <= 12 else module_commit[:8]
+
+    # Try commit hash (core benchmarks)
     commit = first_item.get("commit")
     if commit:
         # Return short hash if already short, otherwise truncate to 8 characters
@@ -539,61 +465,321 @@ def extract_version_identifier(data: List[Dict[str, Any]]) -> str:
     return "Unknown"
 
 
+def extract_version_with_repo(data: List[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+    """Extract a version label and optional repository."""
+    return extract_version_identifier(data), data[0].get("repository") if data else None
+
+
+def format_version_link(version: str, repository: Optional[str]) -> str:
+    """Link a version to its GitHub commit when a repository is available."""
+    if repository:
+        return f"[{version}](https://github.com/{repository}/commit/{version})"
+    return version
+
+
 def group_by_static_configuration(
     data: List[Dict[str, Any]],
+    shared_config_keys: Optional[List[str]] = None,
 ) -> Dict[Tuple, Dict[str, Any]]:
-    """
-    Group benchmark results by static configuration parameters.
-
-    Excludes table-level parameters (command, pipeline, io_threads) that vary
-    within the same test configuration.
-    """
+    """Group rows by config, excluding command, pipeline, and I/O threads."""
     # Parameters that appear in the comparison table, not in config sections
     table_parameters = {"command", "pipeline", "io_threads"}
 
-    # Get configuration keys excluding table parameters
-    config_keys = [
-        key for key in discover_config_keys(data) if key not in table_parameters
-    ]
+    base_keys = (
+        shared_config_keys
+        if shared_config_keys is not None
+        else discover_config_keys(data)
+    )
+    config_keys = [key for key in base_keys if key not in table_parameters]
 
     grouped_configs = {}
     for item in data:
         config_signature = create_config_signature(item, config_keys)
-        if config_signature not in grouped_configs:
-            grouped_configs[config_signature] = {
-                "items": [],
-                "config_keys": config_keys,
-            }
+        grouped_configs.setdefault(
+            config_signature, {"items": [], "config_keys": config_keys}
+        )
         grouped_configs[config_signature]["items"].append(item)
 
     return grouped_configs
+
+
+# Performance metric fields that a comparable benchmark row is expected to carry.
+# A row missing every one of these is not numerically comparable (e.g. a failure
+# marker), but a row that merely holds a zero value still counts as comparable.
+_PERFORMANCE_METRIC_KEYS = (
+    "rps",
+    "avg_latency_ms",
+    "p50_latency_ms",
+    "p95_latency_ms",
+    "p99_latency_ms",
+)
+
+
+def is_failed_row(item: Dict[str, Any]) -> bool:
+    """Return whether a row is explicit failure or has no performance metrics."""
+    return item.get("status") == "failed" or not any(
+        key in item for key in _PERFORMANCE_METRIC_KEYS
+    )
+
+
+def partition_failed_rows(
+    data: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split rows into ``(comparable, failed)`` using :func:`is_failed_row`."""
+    comparable: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for item in data:
+        (failed if is_failed_row(item) else comparable).append(item)
+    return comparable, failed
+
+
+def _make_hashable(value: Any) -> Any:
+    """Recursively freeze dictionaries and sequences for use in identity tuples."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _make_hashable(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_make_hashable(v) for v in value)
+    return value
+
+
+def _scenario_identity(item: Dict[str, Any]) -> Optional[Tuple]:
+    """Return the structural scenario identity, or ``None`` for legacy rows.
+
+    All non-metric configuration and stable environment fields participate so
+    sweeps pair independently. Failure state, display labels, and volatile host
+    readings are excluded so matching success and failure rows still pair.
+    """
+    test_id = item.get("test_id")
+    if test_id is None:
+        return None
+    config_items = tuple(
+        sorted(
+            (key, _make_hashable(value))
+            for key, value in item.items()
+            if key != "test_id"
+            and key not in _NON_IDENTITY_FIELDS
+            and key not in _VOLATILE_ENV_FIELDS
+        )
+    )
+    return (test_id,) + config_items
+
+
+def _identity_set(data: List[Dict[str, Any]]) -> set:
+    """Return the distinct structural identities present in ``data``."""
+    return {
+        identity
+        for identity in (_scenario_identity(row) for row in data)
+        if identity is not None
+    }
+
+
+def _identities_compatible(left: Tuple, right: Tuple) -> bool:
+    """Return whether identities agree on every field they have in common."""
+    if left[0] != right[0]:
+        return False
+    left_fields = dict(left[1:])
+    right_fields = dict(right[1:])
+    if not (
+        left_fields.keys() <= right_fields.keys()
+        or right_fields.keys() <= left_fields.keys()
+    ):
+        return False
+    return all(
+        left_fields[key] == right_fields[key]
+        for key in left_fields.keys() & right_fields.keys()
+    )
+
+
+def _resolve_counterpart_identity(
+    identity: Optional[Tuple], own_ids: set, other_ids: set
+) -> Optional[Tuple]:
+    """Find an exact or unambiguous schema-compatible identity on the other side."""
+    if identity is None:
+        return None
+    if identity in other_ids:
+        return identity
+
+    candidates = [
+        candidate
+        for candidate in other_ids
+        if _identities_compatible(identity, candidate)
+    ]
+    if len(candidates) != 1:
+        return None
+
+    candidate = candidates[0]
+    reverse_candidates = [
+        own for own in own_ids if _identities_compatible(candidate, own)
+    ]
+    return candidate if reverse_candidates == [identity] else None
+
+
+def _paired_identity_key(identity: Optional[Tuple], counterpart: Optional[Tuple]):
+    """Build a shared report key for identities paired across schema versions."""
+    if identity is None or counterpart is None or identity == counterpart:
+        return identity
+    return ("__schema_pair__",) + tuple(sorted((identity, counterpart), key=repr))
+
+
+def _failed_scenario_ids(failed_rows: List[Dict[str, Any]]) -> set:
+    """Collect the non-None scenario identities from a list of failed rows."""
+    return {
+        identity
+        for identity in (_scenario_identity(row) for row in failed_rows)
+        if identity is not None
+    }
+
+
+def _primary_failed_metric(metrics_filter: str) -> Tuple[str, str]:
+    """Select the healthy counterpart value shown for a failed scenario."""
+    if metrics_filter == "latency":
+        return ("avg_latency_ms", "avg_latency")
+    return ("rps", "rps")
+
+
+def collect_failed_scenarios(
+    baseline_data: List[Dict[str, Any]],
+    new_data: List[Dict[str, Any]],
+    metrics_filter: str = "all",
+) -> List[Dict[str, Any]]:
+    """Describe failures and the matching healthy side's primary metric value."""
+    metric_key, metric_label = _primary_failed_metric(metrics_filter)
+
+    def index(data: List[Dict[str, Any]]) -> Tuple[Dict[Tuple, List[Dict]], set]:
+        comparable_by_id: Dict[Tuple, List[Dict[str, Any]]] = {}
+        present_ids = _identity_set(data)
+        for row in data:
+            identity = _scenario_identity(row)
+            if identity is None:
+                continue
+            if not is_failed_row(row):
+                comparable_by_id.setdefault(identity, []).append(row)
+        return comparable_by_id, present_ids
+
+    baseline_comparable, baseline_ids = index(baseline_data)
+    new_comparable, new_ids = index(new_data)
+
+    # Use all rows so a lone failed member of a sweep still names its varying axes.
+    identities_by_test: Dict[Any, List[Dict[str, Any]]] = {}
+    for row in baseline_data + new_data:
+        identity = _scenario_identity(row)
+        if identity is not None:
+            identities_by_test.setdefault(identity[0], []).append(dict(identity[1:]))
+    varying_axes = {
+        test_id: {
+            key
+            for key in set().union(*(fields.keys() for fields in identities))
+            if key != "test_phase"
+            if len({_make_hashable(fields.get(key)) for fields in identities}) > 1
+        }
+        for test_id, identities in identities_by_test.items()
+    }
+
+    descriptors: List[Dict[str, Any]] = []
+    for side, data, own_ids, other_comparable, other_ids in (
+        ("baseline", baseline_data, baseline_ids, new_comparable, new_ids),
+        ("new", new_data, new_ids, baseline_comparable, baseline_ids),
+    ):
+        _, failed = partition_failed_rows(data)
+        for row in failed:
+            identity = _scenario_identity(row)
+            display_axes = {
+                key: row.get(key) for key in varying_axes.get(row.get("test_id"), set())
+            }
+            if row.get("config_set"):
+                display_axes["config_set"] = row["config_set"]
+            counterpart_identity = _resolve_counterpart_identity(
+                identity, own_ids, other_ids
+            )
+            counterpart_rows = other_comparable.get(counterpart_identity, [])
+            counterpart_value = (
+                calculate_mean([r.get(metric_key) for r in counterpart_rows])
+                if counterpart_rows
+                else None
+            )
+            descriptors.append(
+                {
+                    "test_id": row.get("test_id"),
+                    "test_phase": row.get("test_phase"),
+                    "command": row.get("command"),
+                    "side": side,
+                    "error": row.get("error"),
+                    "counterpart_value": counterpart_value,
+                    "counterpart_present": counterpart_identity is not None,
+                    "metric_key": metric_key,
+                    "metric_label": metric_label,
+                    "identity": identity,
+                    "pairing_identity": _paired_identity_key(
+                        identity, counterpart_identity
+                    ),
+                    "config_set": row.get("config_set"),
+                    "cluster_mode": row.get("cluster_mode"),
+                    "io_threads": row.get("io_threads"),
+                    "display_axes": display_axes,
+                }
+            )
+    return descriptors
 
 
 def create_comparison_table_data(
     baseline_data: List[Dict[str, Any]],
     new_data: List[Dict[str, Any]],
     metrics_filter: str = "all",
-) -> Tuple[List[Dict], str, str]:
+) -> Tuple[List[Dict], str, str, Optional[str], Optional[str]]:
     """
     Create structured comparison data for benchmark results.
 
     Returns configuration groups with their comparison table rows,
-    along with version identifiers for both datasets.
+    along with version identifiers and repositories for both datasets.
     """
-    baseline_version = extract_version_identifier(baseline_data)
-    new_version = extract_version_identifier(new_data)
+    baseline_version, baseline_repo = extract_version_with_repo(baseline_data)
+    new_version, new_repo = extract_version_with_repo(new_data)
 
-    # Group data by static configuration
-    baseline_configs = group_by_static_configuration(baseline_data)
-    new_configs = group_by_static_configuration(new_data)
+    baseline_comparable, baseline_failed = partition_failed_rows(baseline_data)
+    new_comparable, new_failed = partition_failed_rows(new_data)
+
+    # Exclude both sides of a failure; the report renders them separately.
+    baseline_ids = _identity_set(baseline_data)
+    new_ids = _identity_set(new_data)
+    baseline_failed_ids = _failed_scenario_ids(baseline_failed)
+    new_failed_ids = _failed_scenario_ids(new_failed)
+    baseline_excluded = set(baseline_failed_ids)
+    new_excluded = set(new_failed_ids)
+    for identity in new_failed_ids:
+        counterpart = _resolve_counterpart_identity(identity, new_ids, baseline_ids)
+        if counterpart is not None:
+            baseline_excluded.add(counterpart)
+    for identity in baseline_failed_ids:
+        counterpart = _resolve_counterpart_identity(identity, baseline_ids, new_ids)
+        if counterpart is not None:
+            new_excluded.add(counterpart)
+
+    if baseline_excluded or new_excluded:
+        baseline_comparable = [
+            row
+            for row in baseline_comparable
+            if _scenario_identity(row) not in baseline_excluded
+        ]
+        new_comparable = [
+            row for row in new_comparable if _scenario_identity(row) not in new_excluded
+        ]
+
+    # Both datasets must use the same signature key space.
+    shared_config_keys = discover_config_keys(baseline_comparable + new_comparable)
+
+    # Group data by static configuration using the shared key list
+    baseline_configs = group_by_static_configuration(
+        baseline_comparable, shared_config_keys
+    )
+    new_configs = group_by_static_configuration(new_comparable, shared_config_keys)
 
     # Define available metrics with their display names
     available_metrics = [
         ("rps", "rps"),
-        ("latency_avg_ms", "avg_latency"),
-        ("latency_p50_ms", "p50_latency"),
-        ("latency_p95_ms", "p95_latency"),
-        ("latency_p99_ms", "p99_latency"),
+        ("avg_latency_ms", "avg_latency"),
+        ("p50_latency_ms", "p50_latency"),
+        ("p95_latency_ms", "p95_latency"),
+        ("p99_latency_ms", "p99_latency"),
     ]
 
     # Select metrics based on filter
@@ -601,10 +787,10 @@ def create_comparison_table_data(
         selected_metrics = [("rps", "rps")]
     elif metrics_filter == "latency":
         selected_metrics = [
-            ("latency_avg_ms", "avg_latency"),
-            ("latency_p50_ms", "p50_latency"),
-            ("latency_p95_ms", "p95_latency"),
-            ("latency_p99_ms", "p99_latency"),
+            ("avg_latency_ms", "avg_latency"),
+            ("p50_latency_ms", "p50_latency"),
+            ("p95_latency_ms", "p95_latency"),
+            ("p99_latency_ms", "p99_latency"),
         ]
     else:  # "all" or any other value
         selected_metrics = available_metrics
@@ -634,6 +820,15 @@ def create_comparison_table_data(
         # Create configuration dictionary for display
         config_dict = dict(zip(config_keys, config_signature))
 
+        # ``config_set`` is frozen outside scalar keys; restore it for display.
+        group_items = baseline_group["items"] or new_group["items"]
+        config_set_label = _format_config_set(
+            group_items[0].get("config_set") if group_items else None
+        )
+        if config_set_label:
+            config_keys = list(config_keys) + ["config_set"]
+            config_dict["config_set"] = config_set_label
+
         # Generate comparison table rows for this configuration
         table_rows = _generate_table_rows_for_config(
             baseline_group["items"], new_group["items"], selected_metrics
@@ -647,7 +842,7 @@ def create_comparison_table_data(
             }
         )
 
-    return configuration_groups, baseline_version, new_version
+    return configuration_groups, baseline_version, new_version, baseline_repo, new_repo
 
 
 def _generate_table_rows_for_config(
@@ -812,26 +1007,26 @@ def _extract_run_statistics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 stats[cv_key] = (stdev_val / mean_val) * 100.0
 
-            # Calculate 99% confidence interval
-            ci_lower, ci_upper = calculate_confidence_interval(values, 0.99)
+            # Calculate confidence interval
+            ci_lower, ci_upper = calculate_confidence_interval(values)
             stats[ci_lower_key] = ci_lower
             stats[ci_upper_key] = ci_upper
 
             # Calculate confidence interval as percentage of mean
             ci_percent_key = f"{metric_base}_ci_percent"
-            ci_percentage = calculate_confidence_interval_percentage(values, 0.99)
+            ci_percentage = calculate_confidence_interval_percentage(values)
             stats[ci_percent_key] = ci_percentage
 
-            # Calculate 99% prediction interval
+            # Calculate prediction interval
             pi_lower_key = f"{metric_base}_pi_lower"
             pi_upper_key = f"{metric_base}_pi_upper"
-            pi_lower, pi_upper = calculate_prediction_interval(values, 0.99)
+            pi_lower, pi_upper = calculate_prediction_interval(values)
             stats[pi_lower_key] = pi_lower
             stats[pi_upper_key] = pi_upper
 
             # Calculate prediction interval as percentage of mean
             pi_percent_key = f"{metric_base}_pi_percent"
-            pi_percentage = calculate_prediction_interval_percentage(values, 0.99)
+            pi_percentage = calculate_prediction_interval_percentage(values)
             stats[pi_percent_key] = pi_percentage
         else:
             stats[stdev_key] = 0.0
@@ -848,132 +1043,631 @@ def _extract_run_statistics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     return stats
 
 
-def format_comparison_report(
-    config_groups: List[Dict], baseline_version: str, new_version: str
-) -> str:
+def _extract_common_and_unique_config(
+    config_groups: List[Dict],
+) -> Tuple[Dict[str, Any], List[Dict]]:
     """
-    Format the comparison data as a markdown report with configuration sections.
+    Extract common configuration shared by all groups and unique config per group.
 
-    Each configuration gets its own section with a comparison table showing
-    performance differences across commands and parameters.
+    Returns:
+        Tuple of (common_config dict, list of groups with unique_config added)
     """
     if not config_groups:
+        return {}, []
+
+    # Get all config keys (excluding statistical fields)
+    def is_display_key(key: str) -> bool:
+        return not (
+            key.endswith("_cv")
+            or key.endswith("_ci_lower")
+            or key.endswith("_ci_upper")
+            or key.endswith("_ci_percent")
+        )
+
+    # Collect all values for each key across all groups
+    all_keys = set()
+    for group in config_groups:
+        all_keys.update(k for k in group["config_keys"] if is_display_key(k))
+
+    # Find common config (same value across all groups)
+    common_config = {}
+    varying_keys = set()
+
+    for key in all_keys:
+        values = set()
+        for group in config_groups:
+            value = group["config_dict"].get(key)
+            if value is not None:
+                values.add(value)
+
+        if len(values) == 1:
+            # Same value in all groups - it's common
+            common_config[key] = values.pop()
+        elif len(values) > 1:
+            # Different values - it varies
+            varying_keys.add(key)
+
+    # Add unique_config to each group (only varying keys)
+    updated_groups = []
+    for group in config_groups:
+        unique_config = {}
+        for key in varying_keys:
+            value = group["config_dict"].get(key)
+            if value is not None:
+                unique_config[key] = value
+
+        updated_group = group.copy()
+        updated_group["unique_config"] = unique_config
+        updated_groups.append(updated_group)
+
+    return common_config, updated_groups
+
+
+def _generate_summary(
+    config_groups: List[Dict],
+) -> Tuple[List[Dict], List[Dict], int, int]:
+    """Collect significant changes and unchanged/insufficient counts."""
+    improvements = []
+    regressions = []
+    no_change_count = 0
+    insufficient_data_count = 0
+
+    for group in config_groups:
+        unique_config = group.get("unique_config", {})
+        config_str = (
+            ", ".join(f"{k}={v}" for k, v in sorted(unique_config.items()))
+            if unique_config
+            else ""
+        )
+
+        for row in group.get("table_rows", []):
+            significance = _get_significance_indicator(
+                row.get("baseline_run_count", 0),
+                row.get("new_run_count", 0),
+                row.get("baseline_ci_lower", 0.0),
+                row.get("baseline_ci_upper", 0.0),
+                row.get("new_ci_lower", 0.0),
+                row.get("new_ci_upper", 0.0),
+                row["change"],
+                row["metric"],
+            )
+
+            test_label = f"{row['command']} {row['metric']} pipe={row['pipeline']} threads={row['io_threads']}"
+            if config_str:
+                test_label = f"{test_label} ({config_str})"
+
+            change_formatted = _format_percent_change(
+                row["baseline_value"],
+                row.get("baseline_stdev", 0.0),
+                row["new_value"],
+                row.get("new_stdev", 0.0),
+                row.get("baseline_run_count", 0),
+                row.get("new_run_count", 0),
+            )
+
+            if significance == "✅":
+                improvements.append(
+                    {
+                        "test": test_label,
+                        "change": change_formatted,
+                        "change_magnitude": abs(row["change"]),
+                    }
+                )
+            elif significance == "❌":
+                regressions.append(
+                    {
+                        "test": test_label,
+                        "change": change_formatted,
+                        "change_magnitude": abs(row["change"]),
+                    }
+                )
+            elif significance == "❔":
+                insufficient_data_count += 1
+            else:
+                no_change_count += 1
+
+    return improvements, regressions, no_change_count, insufficient_data_count
+
+
+def _sanitize_table_cell(text: Optional[str]) -> str:
+    """Render untrusted text as a literal code span inside a Markdown table."""
+    if text is None:
+        return ""
+    s = str(text).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = s.strip()
+    if not s:
+        return ""
+
+    # GitHub creates mentions and issue/email links after decoding character
+    # references. Code spans suppress that post-processing. Use a fence longer
+    # than any run in the value so embedded backticks cannot close the span.
+    longest_run = current_run = 0
+    for char in s:
+        current_run = current_run + 1 if char == "`" else 0
+        longest_run = max(longest_run, current_run)
+    fence = "`" * (longest_run + 1)
+
+    # GFM finds table separators before parsing inline code, so pipes still
+    # need a backslash at the table layer. The backslash is not displayed.
+    s = s.replace("|", r"\|")
+    return f"{fence} {s} {fence}"
+
+
+def _config_set_text(config_set: Optional[Dict[str, Any]]) -> str:
+    """Return sorted ``config_set`` key/value pairs as plain text."""
+    if not config_set:
+        return ""
+    return "; ".join(f"{k}={config_set[k]}" for k in sorted(config_set, key=str))
+
+
+def _format_config_set(config_set: Optional[Dict[str, Any]]) -> str:
+    """Render sorted ``config_set`` key/value pairs as literal text."""
+    return _sanitize_table_cell(_config_set_text(config_set))
+
+
+def _failed_side_cell(
+    own_entry: Optional[Dict[str, Any]],
+    other_entry: Optional[Dict[str, Any]],
+) -> str:
+    """Render ``FAILED``, the healthy counterpart value, or ``n/a``."""
+    if own_entry is not None:
+        return "**FAILED**"
+    if other_entry is None:
+        return "n/a"
+    value = other_entry.get("counterpart_value")
+    if value is None:
+        return "n/a"
+    label = other_entry.get("metric_label", "")
+    return _sanitize_table_cell(f"{_format_with_sig_figs(value)} {label}".strip())
+
+
+def _failed_error_cell(
+    baseline_entry: Optional[Dict[str, Any]],
+    new_entry: Optional[Dict[str, Any]],
+) -> str:
+    """Render one error, or side-prefixed errors when both sides failed."""
+    parts = []
+    if baseline_entry is not None:
+        parts.append(("baseline", baseline_entry.get("error")))
+    if new_entry is not None:
+        parts.append(("new", new_entry.get("error")))
+
+    def clean(err: Optional[str]) -> str:
+        return str(err).strip() if err else "no error recorded"
+
+    if len(parts) == 1:
+        error_text = clean(parts[0][1])
+    else:
+        error_text = "; ".join(f"{side}: {clean(err)}" for side, err in parts)
+    return _sanitize_table_cell(error_text)
+
+
+def _failed_scenario_label(descriptor: Dict[str, Any]) -> str:
+    """Render a scenario id plus config axes that distinguish failed rows."""
+    label = str(descriptor.get("test_id") or "unknown")
+    axis_bits: List[str] = []
+    aliases = {"cluster_mode": "cluster"}
+    for key, value in sorted(descriptor.get("display_axes", {}).items()):
+        if key == "config_set":
+            axis_bits.append(_config_set_text(value))
+        elif value is not None:
+            name = aliases.get(key, key)
+            axis_bits.append(f"{name}={value}")
+
+    if axis_bits:
+        label = f"{label} ({'; '.join(axis_bits)})"
+    return _sanitize_table_cell(label)
+
+
+def _format_failed_scenarios_section(
+    failed_scenarios: List[Dict[str, Any]],
+    baseline_version: str,
+    new_version: str,
+) -> List[str]:
+    """Render failures by full scenario identity as a two-sided table."""
+    grouped: Dict[Any, List[Dict[str, Any]]] = {}
+    for failure in failed_scenarios:
+        key = failure.get("pairing_identity", failure.get("identity"))
+        if key is None:
+            key = ("__no_id__", id(failure))
+        grouped.setdefault(key, []).append(failure)
+
+    lines = [
+        f"## ⚠️ {len(grouped)} failed scenario(s)",
+        "",
+        "Excluded from the numeric comparison (a failure has nothing to compare "
+        "against); the measured value is shown for whichever side succeeded:",
+        "",
+        f"| Scenario | Phase | Command | "
+        f"{_sanitize_table_cell(baseline_version)} | "
+        f"{_sanitize_table_cell(new_version)} | Error |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+
+    for entries in grouped.values():
+        baseline_entry = next((e for e in entries if e["side"] == "baseline"), None)
+        new_entry = next((e for e in entries if e["side"] == "new"), None)
+        sample = entries[0]
+
+        test_id = _failed_scenario_label(sample)
+        phase = _sanitize_table_cell(sample.get("test_phase"))
+        command = _sanitize_table_cell(sample.get("command"))
+        baseline_cell = _failed_side_cell(baseline_entry, new_entry)
+        new_cell = _failed_side_cell(new_entry, baseline_entry)
+        error_cell = _failed_error_cell(baseline_entry, new_entry)
+
+        lines.append(
+            f"| {test_id} | {phase} | {command} | "
+            f"{baseline_cell} | {new_cell} | {error_cell} |"
+        )
+
+    lines.append("")
+    return lines
+
+
+def format_comparison_report(
+    config_groups: List[Dict],
+    baseline_version: str,
+    new_version: str,
+    baseline_repo: Optional[str] = None,
+    new_repo: Optional[str] = None,
+    core_commit_baseline: Optional[str] = None,
+    core_commit_new: Optional[str] = None,
+    failed_scenarios: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Format summary, failures, and comparison tables as Markdown."""
+    if not config_groups and not failed_scenarios:
         return "No data to compare."
+
+    # Format version headers with links if repositories available
+    baseline_header = format_version_link(baseline_version, baseline_repo)
+    new_header = format_version_link(new_version, new_repo)
+
+    # Extract common vs unique configuration
+    common_config, groups_with_unique = _extract_common_and_unique_config(config_groups)
+
+    # Generate summary
+    improvements, regressions, no_change_count, insufficient_data_count = (
+        _generate_summary(groups_with_unique)
+    )
 
     report_lines = []
 
-    for group in config_groups:
-        config_dict = group["config_dict"]
-        config_keys = group["config_keys"]
+    # Summary section
+    significant_changes = [
+        ("✅", item["change"], item["test"], item["change_magnitude"])
+        for item in improvements
+    ] + [
+        ("❌", item["change"], item["test"], item["change_magnitude"])
+        for item in regressions
+    ]
+    significant_changes.sort(key=lambda x: x[3], reverse=True)
+
+    total_tests = len(significant_changes) + no_change_count + insufficient_data_count
+
+    if significant_changes:
+        report_lines.append(f"## {len(significant_changes)} significant change(s)")
+        report_lines.append("")
+        for emoji, change, test, _ in significant_changes:
+            report_lines.append(f"- {emoji} {change} {test}")
+        report_lines.append("")
+    else:
+        report_lines.append("## No significant changes")
+        report_lines.append("")
+        report_lines.append(
+            f"No statistically significant changes detected across {total_tests} test(s)."
+        )
+        report_lines.append("")
+
+    # Summary counts
+    summary_parts = []
+    if no_change_count:
+        summary_parts.append(f"{no_change_count} with no significant change")
+    if insufficient_data_count:
+        summary_parts.append(f"{insufficient_data_count} with insufficient data")
+    if summary_parts:
+        report_lines.append(f"*{', '.join(summary_parts)}*")
+        report_lines.append("")
+
+    if failed_scenarios:
+        report_lines.extend(
+            _format_failed_scenarios_section(
+                failed_scenarios, baseline_version, new_version
+            )
+        )
+
+    # Collapsible details section
+    report_lines.append("<details>")
+    report_lines.append("<summary>Click to expand full comparison tables</summary>")
+    report_lines.append("")
+
+    # Check if we have multiple groups with varying config
+    has_varying_config = any(g.get("unique_config") for g in groups_with_unique)
+
+    for group in groups_with_unique:
+        unique_config = group.get("unique_config", {})
         table_rows = group["table_rows"]
 
         if not table_rows:
             continue
 
-        # Configuration section header
-        report_lines.append("**Configuration:**")
-        for key in sorted(config_keys):
-            value = config_dict.get(key)
-            # Exclude statistical fields from configuration display (they are statistical results, not config parameters)
-            if (
-                value is not None
-                and not key.endswith("_cv")
-                and not key.endswith("_ci_lower")
-                and not key.endswith("_ci_upper")
-                and not key.endswith("_ci_percent")
-            ):
-                report_lines.append(f"- {key}: {value}")
-        report_lines.append("")
+        # Only show heading if there are varying attributes across groups
+        if has_varying_config and unique_config:
+            config_str = ", ".join(
+                f"{k} = {v}" for k, v in sorted(unique_config.items())
+            )
+            report_lines.append(f"### {config_str}")
+            report_lines.append("")
 
         # Comparison table for this configuration
         report_lines.extend(
             [
-                f"| Command | Metric | Pipeline | io_threads | {baseline_version} | {new_version} | Diff | % Change |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                f"| | % Change | Test | {baseline_header} | {new_header} | {baseline_version} stats | {new_version} stats |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
 
         for row in table_rows:
-            # Format metric values with statistical information
-            baseline_display = _format_metric_value(
-                row["baseline_value"],
+            # Format metric values with uncertainty-based precision
+            baseline_stdev = (
+                row.get("baseline_stdev", 0.0)
+                if row.get("baseline_run_count", 0) > 1
+                else 0
+            )
+            new_stdev = (
+                row.get("new_stdev", 0.0) if row.get("new_run_count", 0) > 1 else 0
+            )
+            baseline_display = _format_with_sig_figs(
+                row["baseline_value"], baseline_stdev
+            )
+            new_display = _format_with_sig_figs(row["new_value"], new_stdev)
+
+            # Determine significance indicator
+            significance = _get_significance_indicator(
                 row.get("baseline_run_count", 0),
-                row.get("baseline_stdev", 0.0),
-                row.get("baseline_cv", 0.0),
+                row.get("new_run_count", 0),
                 row.get("baseline_ci_lower", 0.0),
                 row.get("baseline_ci_upper", 0.0),
-                row.get("baseline_ci_percent", 0.0),
-                row.get("baseline_pi_lower", 0.0),
-                row.get("baseline_pi_upper", 0.0),
-                row.get("baseline_pi_percent", 0.0),
-            )
-
-            new_display = _format_metric_value(
-                row["new_value"],
-                row.get("new_run_count", 0),
-                row.get("new_stdev", 0.0),
-                row.get("new_cv", 0.0),
                 row.get("new_ci_lower", 0.0),
                 row.get("new_ci_upper", 0.0),
-                row.get("new_ci_percent", 0.0),
-                row.get("new_pi_lower", 0.0),
-                row.get("new_pi_upper", 0.0),
-                row.get("new_pi_percent", 0.0),
+                row["change"],
+                row["metric"],
+            )
+
+            # Format % change with uncertainty
+            change_formatted = _format_percent_change(
+                row["baseline_value"],
+                row.get("baseline_stdev", 0.0),
+                row["new_value"],
+                row.get("new_stdev", 0.0),
+                row.get("baseline_run_count", 0),
+                row.get("new_run_count", 0),
             )
 
             # Create table row
+            test_label = f"{row['command']} {row['metric']} P{row['pipeline']} T{row['io_threads']}"
+
+            # Format stats separately
+            baseline_stats_display = _format_stats_only(
+                row.get("baseline_run_count", 0),
+                row.get("baseline_stdev", 0.0),
+                row.get("baseline_cv", 0.0),
+                row.get("baseline_ci_percent", 0.0),
+                row.get("baseline_pi_percent", 0.0),
+            )
+            new_stats_display = _format_stats_only(
+                row.get("new_run_count", 0),
+                row.get("new_stdev", 0.0),
+                row.get("new_cv", 0.0),
+                row.get("new_ci_percent", 0.0),
+                row.get("new_pi_percent", 0.0),
+            )
+
             report_lines.append(
-                f"| {row['command']} | {row['metric']} | {row['pipeline']} | {row['io_threads']} | "
-                f"{baseline_display} | {new_display} | "
-                f"{row['diff']:.3f} | {row['change']:+.3f}% |"
+                f"| {significance} | {change_formatted} | {test_label} | "
+                f"{baseline_display} | {new_display} | {baseline_stats_display} | {new_stats_display} |"
             )
 
         report_lines.append("")
 
+    # Add common configuration
+    if common_config:
+        report_lines.append("---")
+        report_lines.append("")
+        report_lines.append("**Configuration:**")
+        for key in sorted(common_config.keys()):
+            report_lines.append(f"- {key}: {common_config[key]}")
+        report_lines.append("")
+
+    # Add core commit metadata
+    if core_commit_baseline or core_commit_new:
+        if core_commit_baseline == core_commit_new:
+            report_lines.append(f"**Core commit:** {core_commit_baseline}")
+        else:
+            report_lines.append(
+                f"**Core commit:** {core_commit_baseline} (baseline) → "
+                f"{core_commit_new} (new)"
+            )
+        report_lines.append("")
+
+    # Add legend
+    report_lines.append("**Legend:**")
+    report_lines.append(
+        "- **Test column**: Command, metric, P=pipeline depth, T=io-threads"
+    )
+    report_lines.append(
+        "- **Significance**: ✅ significant improvement, ❌ significant regression, ➖ not significant, ❔ insufficient data"
+    )
+    report_lines.append("")
+    report_lines.append("**Statistical Notes:**")
+    report_lines.append(
+        "- **CV**: Coefficient of Variation - relative variability (σ/μ × 100%)"
+    )
+    report_lines.append(
+        f"- **CI{CONFIDENCE_PERCENT}%**: {CONFIDENCE_PERCENT}% Confidence Interval - range where the true population mean is likely to fall"
+    )
+    report_lines.append(
+        f"- **PI{CONFIDENCE_PERCENT}%**: {CONFIDENCE_PERCENT}% Prediction Interval - range where a single future observation is likely to fall"
+    )
+    report_lines.append("")
+
+    # Close collapsible section
+    report_lines.append("</details>")
+
     return "\n".join(report_lines)
 
 
-def _format_metric_value(
-    value: float,
+def _get_significance_indicator(
+    baseline_run_count: int,
+    new_run_count: int,
+    baseline_ci_lower: float,
+    baseline_ci_upper: float,
+    new_ci_lower: float,
+    new_ci_upper: float,
+    change_percent: float,
+    metric: str,
+) -> str:
+    """Classify CI overlap, accounting for whether lower values are better."""
+    if baseline_run_count <= 1 or new_run_count <= 1:
+        return "❔"
+
+    lower_is_better = "latency" in metric
+
+    if new_ci_lower > baseline_ci_upper:
+        return "❌" if lower_is_better else "✅"
+    if new_ci_upper < baseline_ci_lower:
+        return "✅" if lower_is_better else "❌"
+    return "➖"
+
+
+def calculate_percent_change_with_ci(
+    baseline_value: float,
+    baseline_stdev: float,
+    new_value: float,
+    new_stdev: float,
+    baseline_run_count: int,
+    new_run_count: int,
+) -> Tuple[float, Optional[float]]:
+    """Return percentage change and an optional propagated CI margin."""
+    if baseline_value == 0:
+        return (0.0, None)
+
+    change_percent = ((new_value - baseline_value) / baseline_value) * 100
+
+    if (
+        baseline_run_count > 1
+        and new_run_count > 1
+        and baseline_stdev > 0
+        and new_stdev > 0
+    ):
+        baseline_se = baseline_stdev / math.sqrt(baseline_run_count)
+        new_se = new_stdev / math.sqrt(new_run_count)
+
+        baseline = ufloat(baseline_value, baseline_se)
+        new = ufloat(new_value, new_se)
+
+        change_with_uncertainty = (new - baseline) / baseline * 100
+
+        # Conservative: use the smaller df for a wider (safer) CI
+        df = min(baseline_run_count - 1, new_run_count - 1)
+        alpha = 1 - CONFIDENCE_LEVEL
+        t_crit = stats.t.ppf(1 - alpha / 2, df)
+
+        return (
+            change_with_uncertainty.nominal_value,
+            t_crit * change_with_uncertainty.std_dev,
+        )
+
+    return (change_percent, None)
+
+
+def _format_percent_change(
+    baseline_value: float,
+    baseline_stdev: float,
+    new_value: float,
+    new_stdev: float,
+    baseline_run_count: int,
+    new_run_count: int,
+) -> str:
+    """Format percentage change with uncertainty as a display string."""
+    if baseline_value == 0:
+        return "N/A"
+
+    change, ci_margin = calculate_percent_change_with_ci(
+        baseline_value,
+        baseline_stdev,
+        new_value,
+        new_stdev,
+        baseline_run_count,
+        new_run_count,
+    )
+
+    if ci_margin is not None:
+        scaled = ufloat(change, ci_margin)
+        return f"{scaled:+.1uP}%"
+
+    return f"{change:+.1f}%"
+
+
+# Unit suffixes for 1000x scaling (largest first)
+_UNIT_SUFFIXES = [
+    (1e12, "T"),
+    (1e9, "B"),
+    (1e6, "M"),
+    (1e3, "K"),
+]
+
+
+def _format_with_sig_figs(value: float, uncertainty: float = 0.0) -> str:
+    """Format a value using uncertainty-aware precision and unit suffixes."""
+    if value == 0:
+        return "0"
+
+    abs_value = abs(value)
+
+    # Find appropriate unit suffix
+    suffix = ""
+    divisor = 1
+    scaled = value
+    for div, unit in _UNIT_SUFFIXES:
+        if abs_value >= div:
+            divisor = div
+            suffix = unit
+            scaled = value / divisor
+            break
+
+    # Determine decimal places
+    if uncertainty > 0:
+        scaled_uncertainty = uncertainty / divisor
+        decimals = max(0, min(4, -math.floor(math.log10(scaled_uncertainty))))
+    else:
+        # 3 significant figures
+        decimals = max(0, 2 - math.floor(math.log10(abs(scaled))))
+
+    return f"{scaled:.{decimals}f}{suffix}"
+
+
+def _format_stats_only(
     run_count: int,
     stdev: float,
     cv: float = 0.0,
-    ci_lower: float = 0.0,
-    ci_upper: float = 0.0,
     ci_percent: float = 0.0,
-    pi_lower: float = 0.0,
-    pi_upper: float = 0.0,
     pi_percent: float = 0.0,
 ) -> str:
-    """Format a metric value with optional run count, standard deviation, coefficient of variation, confidence interval, and prediction interval."""
-    formatted_value = f"{value:.3f}"
+    """Format statistical information only (no value)."""
+    if run_count <= 1:
+        return "n=1"
 
-    # Add statistical information for multiple runs
-    if run_count > 1:
-        # Include CV, CI99%, and PI99% percentages in the main statistical display
-        ci_precision = 6 if ci_percent < 0.001 else 3
-        pi_precision = 6 if pi_percent < 0.001 else 3
+    formatted_stdev = _format_with_sig_figs(stdev)
 
-        # Only show non-zero percentages
-        stats_parts = [f"CV={cv:.2f}%"]
-        if ci_percent > 0.0001:
-            stats_parts.append(f"CI99%=±{ci_percent:.{ci_precision}f}%")
-        if pi_percent > 0.0001:
-            stats_parts.append(f"PI99%=±{pi_percent:.{pi_precision}f}%")
+    # Format percentages with 1 decimal place
+    stats_parts = [f"n={run_count}", f"σ={formatted_stdev}", f"CV={cv:.1f}%"]
+    if ci_percent > 0.01:
+        stats_parts.append(f"CI{CONFIDENCE_PERCENT}%=±{ci_percent:.1f}%")
+    if pi_percent > 0.01:
+        stats_parts.append(f"PI{CONFIDENCE_PERCENT}%=±{pi_percent:.1f}%")
 
-        stats_text = ", ".join(stats_parts)
-
-        ci_bounds_text = ""
-        if ci_lower != 0.0 or ci_upper != 0.0:
-            ci_bounds_text = f", CI[{ci_lower:.3f}, {ci_upper:.3f}]"
-
-        pi_bounds_text = ""
-        if pi_lower != 0.0 or pi_upper != 0.0:
-            pi_bounds_text = f", PI[{pi_lower:.3f}, {pi_upper:.3f}]"
-
-        formatted_value += f" (n={run_count}, σ={stdev:.3f}, {stats_text}{ci_bounds_text}{pi_bounds_text})"
-
-    return formatted_value
+    return ", ".join(stats_parts)
 
 
 def generate_comparison_graphs(
@@ -1009,26 +1703,15 @@ def generate_comparison_graphs(
 
     # Collect all data for graphing
     all_rows = []
-    config_info = []
     for group in config_groups:
         all_rows.extend(group["table_rows"])
-        # Extract config info for legend
-        config_dict = group["config_dict"]
-        config_str = ", ".join(
-            [f"{k}={v}" for k, v in config_dict.items() if v is not None]
-        )
-        config_info.append(config_str)
 
     if not all_rows:
         return []
 
-    # Get unique config string for legends
-    unique_configs = list(set(config_info))
-    config_label = unique_configs[0] if len(unique_configs) == 1 else "mixed_configs"
-
     # Generate single consolidated metrics comparison graph
     comprehensive_graph_path = generate_consolidated_metrics_graph(
-        all_rows, baseline_version, new_version, output_path, config_label
+        all_rows, baseline_version, new_version, output_path
     )
     if comprehensive_graph_path:
         generated_files.append(comprehensive_graph_path)
@@ -1092,7 +1775,7 @@ def generate_variance_line_graphs(
             if graph_path:
                 generated_files.append(graph_path)
 
-    except Exception as e:
+    except Exception:
         pass  # Silently handle errors in graph generation
 
     return generated_files
@@ -1178,16 +1861,10 @@ def _generate_single_variance_graph(
             new_values = []
 
             for run in baseline_runs:
-                value = run.get(
-                    metric, run.get(f'latency_{metric.split("_")[-1]}', 0.0)
-                )
-                baseline_values.append(value)
+                baseline_values.append(run.get(metric, 0.0))
 
             for run in new_runs:
-                value = run.get(
-                    metric, run.get(f'latency_{metric.split("_")[-1]}', 0.0)
-                )
-                new_values.append(value)
+                new_values.append(run.get(metric, 0.0))
 
             # Plot baseline runs
             if baseline_values:
@@ -1206,9 +1883,7 @@ def _generate_single_variance_graph(
                 # Add mean line and prediction interval
                 if len(baseline_values) > 1:
                     mean_val = statistics.mean(baseline_values)
-                    pi_lower, pi_upper = calculate_prediction_interval(
-                        baseline_values, 0.99
-                    )
+                    pi_lower, pi_upper = calculate_prediction_interval(baseline_values)
                     ax.axhline(y=mean_val, color="steelblue", linestyle="--", alpha=0.6)
                     ax.fill_between(
                         baseline_x,
@@ -1216,7 +1891,7 @@ def _generate_single_variance_graph(
                         [pi_upper] * len(baseline_x),
                         color="steelblue",
                         alpha=0.2,
-                        label=f"{baseline_version} 99% PI",
+                        label=f"{baseline_version} {CONFIDENCE_PERCENT}% PI",
                     )
 
             # Plot new version runs
@@ -1236,7 +1911,7 @@ def _generate_single_variance_graph(
                 # Add mean line and prediction interval
                 if len(new_values) > 1:
                     mean_val = statistics.mean(new_values)
-                    pi_lower, pi_upper = calculate_prediction_interval(new_values, 0.99)
+                    pi_lower, pi_upper = calculate_prediction_interval(new_values)
                     ax.axhline(
                         y=mean_val, color="mediumseagreen", linestyle="--", alpha=0.6
                     )
@@ -1246,7 +1921,7 @@ def _generate_single_variance_graph(
                         [pi_upper] * len(new_x),
                         color="mediumseagreen",
                         alpha=0.2,
-                        label=f"{new_version} 99% PI",
+                        label=f"{new_version} {CONFIDENCE_PERCENT}% PI",
                     )
 
             # Formatting
@@ -1282,7 +1957,7 @@ def _generate_single_variance_graph(
 
         return str(graph_path)
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -1291,7 +1966,6 @@ def generate_consolidated_metrics_graph(
     baseline_version: str,
     new_version: str,
     output_path: Path,
-    config_label: str,
 ) -> Optional[str]:
     """Generate a single consolidated comparison graph for all metrics with proper legend format."""
     try:
@@ -1426,7 +2100,7 @@ def generate_consolidated_metrics_graph(
 
         return str(graph_path)
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -1529,23 +2203,22 @@ def main():
     baseline_data = load_benchmark_data(baseline_file)
     new_data = load_benchmark_data(new_file)
 
-    # Track original data sizes for summary
-    original_baseline_count = len(baseline_data)
-    original_new_count = len(new_data)
+    # Collect failed / non-comparable scenarios from the RAW rows (before
+    # averaging) so their recorded error text is preserved for the report. The
+    # metrics_filter selects which surviving-side metric to surface.
+    failed_scenarios = collect_failed_scenarios(baseline_data, new_data, metrics_filter)
+
+    # Union-based key discovery over both raw datasets, threaded into the
+    # run-averaging path so both sides group runs over an identical key space.
+    shared_config_keys = discover_config_keys(baseline_data + new_data)
 
     # Always apply dynamic averaging for consistent comparisons
-    baseline_data = average_multiple_runs(baseline_data)
-    new_data = average_multiple_runs(new_data)
-
-    # Calculate averaging statistics
-    baseline_avg_runs = (
-        original_baseline_count / len(baseline_data) if baseline_data else 0
-    )
-    new_avg_runs = original_new_count / len(new_data) if new_data else 0
+    baseline_data = average_multiple_runs(baseline_data, shared_config_keys)
+    new_data = average_multiple_runs(new_data, shared_config_keys)
 
     # Generate comparison data
-    config_groups, baseline_version, new_version = create_comparison_table_data(
-        baseline_data, new_data, metrics_filter
+    config_groups, baseline_version, new_version, baseline_repo, new_repo = (
+        create_comparison_table_data(baseline_data, new_data, metrics_filter)
     )
 
     # Generate graphs if requested
@@ -1569,29 +2242,40 @@ def main():
                 print(f"  - {file_path}")
 
     # Format the comparison report
+    # Extract core commit if module_commit is used as the version identifier
+    core_commit_baseline = None
+    core_commit_new = None
+    if baseline_data and baseline_data[0].get("module_commit"):
+        core_commit_baseline = baseline_data[0].get("commit")
+    if new_data and new_data[0].get("module_commit"):
+        core_commit_new = new_data[0].get("commit")
+
     comparison_table = format_comparison_report(
-        config_groups, baseline_version, new_version
+        config_groups,
+        baseline_version,
+        new_version,
+        baseline_repo,
+        new_repo,
+        core_commit_baseline=core_commit_baseline,
+        core_commit_new=core_commit_new,
+        failed_scenarios=failed_scenarios,
     )
 
     # Create final report with metadata
-    metrics_info = f" - {metrics_filter} metrics" if metrics_filter != "all" else ""
+    if metrics_filter == "rps":
+        title_prefix = "RPS "
+    elif metrics_filter == "latency":
+        title_prefix = "Latency "
+    else:
+        title_prefix = ""
 
-    run_summary = (
-        f"\n\n**Run Summary:**\n"
-        f"- {baseline_version}: {original_baseline_count} total runs, "
-        f"{len(baseline_data)} configurations (avg {baseline_avg_runs:.2f} runs per config)\n"
-        f"- {new_version}: {original_new_count} total runs, "
-        f"{len(new_data)} configurations (avg {new_avg_runs:.2f} runs per config)\n\n"
-        f"**Statistical Notes:**\n"
-        f"- **CI99%**: 99% Confidence Interval - range where the true population mean is likely to fall\n"
-        f"- **PI99%**: 99% Prediction Interval - range where a single future observation is likely to fall\n"
-        f"- **CV**: Coefficient of Variation - relative variability (σ/μ × 100%)\n\n"
-        f"*Note: Values with (n=X, σ=Y, CV=Z%, CI99%=±W%, PI99%=±V%) indicate averages from X runs with standard deviation Y, coefficient of variation Z%, 99% confidence interval margin of error ±W% of the mean, and 99% prediction interval margin of error ±V% of the mean. CI bounds [A, B] and PI bounds [C, D] show the actual interval ranges.*"
-    )
+    # Format version links for title
+    baseline_title = format_version_link(baseline_version, baseline_repo)
+    new_title = format_version_link(new_version, new_repo)
 
     final_report = (
-        f"# Benchmark Comparison: {baseline_version} vs {new_version} (averaged){metrics_info}"
-        f"{run_summary}\n\n{comparison_table}\n"
+        f"# {title_prefix}Benchmark Comparison: {baseline_title} vs {new_title}\n\n"
+        f"{comparison_table}\n"
     )
 
     # Output the report
